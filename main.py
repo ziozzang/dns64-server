@@ -12,8 +12,15 @@
 
 import socket,ipaddress
 
-from dnslib import DNSRecord, RCODE, RR, DNSHeader, A, AAAA
+from dnslib import *
 from dnslib.server import DNSServer,DNSHandler,BaseResolver,DNSLogger
+
+import doh
+
+DNSMAP = { 5:CNAME, 1:A, 28:AAAA, 16:TXT, 15:MX,
+          12:PTR, 6:SOA, 2:NS, 35: NAPTR, 33:SRV,
+          48:DNSKEY, 46:RRSIG, 47:NSEC, 257:CAA
+        }
 
 DNS_AAAA_RECORD = 28
 DNS_A_RECORD = 1
@@ -21,15 +28,20 @@ DNS_A_RECORD = 1
 config = {
     #"IPV6_PREFIX":"fdcb:b3ab:4522:fa5a::",
     "IPV6_PREFIX":"64:ff9b::",
-    #"DNS_RESOLVER": "8.8.8.8",
-    "DNS_RESOLVER_HOST": "1.1.1.1", # Cloudflare
+
+    #"DNS_RESOLVER_HOST": "8.8.8.8", # Google (ipv4)
+    "DNS_RESOLVER_HOST": "1.1.1.1", # Cloudflare (ipv4)
     "DNS_RESOLVER_PORT": 53,
     "DNS_RESOLVER_TIMEOUT": 5, #Sec
+    "DNS_RESOLVER_URL": 'https://dns.google.com/resolve', # For DNS over HTTPS (Google)
+    #"DNS_RESOLVER_URL": "https://1.1.1.1/dns-query", # For DNS over HTTPS (Cloudflare) - TODO
+
+    "DNS_RESOLVER_TYPE": "doh", # doh, udp
 
     "port": 5354,
     "addr": "0.0.0.0",
 
-    "allow_ip_list": ["0.0.0.0/0",'0::'], # Allow from all
+    "allow_ip_list": ["0.0.0.0/0",'0::'],
 }
 
 class DNS64ProxyResolver(BaseResolver):
@@ -77,55 +89,98 @@ class DNS64ProxyResolver(BaseResolver):
                     reply.header.rcode = getattr(RCODE, 'NXDOMAIN')
                     return reply
 
-                orig_proxy_r = request.send(
-                                    self.address,self.port,
-                                    timeout=self.timeout
-                                )
-                # Originally reply same as upstream result
-                reply = DNSRecord.parse(orig_proxy_r)
+                if config["DNS_RESOLVER_TYPE"] == 'doh':
+                    dohr = doh.SecureDNS(query_type=request.q.qtype, url=config["DNS_RESOLVER_URL"]).\
+                        resolve(request.q.qname)
 
-                if  (request.q.qtype == DNS_AAAA_RECORD) and \
-                    (
-                      (len(reply.rr) < 1) or
-                      (reply.rr[0].rtype != DNS_AAAA_RECORD)
-                    ):
-                    # if need modification,
-                    # - There's no AAAA recored is returned.
-                    # - Other record is mixed reply (for example CNAME -> A or some mixed...)
+                    reply = request.reply()
 
-                    request.q.qtype = DNS_A_RECORD
-                    orig_proxy_r = request.send(
-                                self.address,
-                                self.port,
-                                timeout=self.timeout)
-                    orig_reply = DNSRecord.parse(orig_proxy_r)
-                    request.q.qtype = DNS_AAAA_RECORD
+                    if request.q.qtype == DNS_AAAA_RECORD:
+                        if (dohr is None) or ((type(dohr) == type([])) and (len(dohr) == 0)):
+                            dohr = doh.SecureDNS(query_type=DNS_A_RECORD, url=config["DNS_RESOLVER_URL"]).\
+                                resolve(request.q.qname)
 
-                    if len(orig_reply.rr) > 0:
-                        # Upstream results are more than one item,
-                        reply = DNSRecord(
-                            DNSHeader(
-                                id=orig_reply.header.id,qr=1,ra=1
-                            ),
-                            q=request.q
-                        )
-
-                        for r in orig_reply.rr:
-                            if  (r.rtype != DNS_AAAA_RECORD) and \
-                                (r.rtype != DNS_A_RECORD):
-                                # CNAME or some DNS type must be same as upstream result.
+                        for r in dohr:
+                            if r['type'] == DNS_A_RECORD:
                                 reply.add_answer(
-                                    RR(r.rname, rtype=r.rtype, ttl=r.ttl,
-                                       rdata=r.rdata)
+                                        RR(r['name'], rtype=DNS_AAAA_RECORD,ttl=r['TTL'],
+                                           rdata=self._conv_ipv4_to_v6(r['data']))
                                 )
                             else:
                                 reply.add_answer(
-                                    RR(r.rname, rtype=DNS_AAAA_RECORD, ttl=r.ttl,
-                                       rdata=self._conv_ipv4_to_v6(r.rdata))
-                                )
-            else:
-                proxy_r = request.send(self.address,self.port,
-                                tcp=True,timeout=self.timeout)
+                                        RR(r['name'], rtype=r['type'],ttl=r['TTL'],
+                                           rdata=DNSMAP[r['type']](r['data']))
+                                    )
+
+                    else:
+                        if (type(dohr) == type([])) and (len(dohr) > 0):
+                            for r in dohr:
+                                if r['type'] == 15:
+                                    rmx = r['data'].split()
+                                    rd = DNSMAP[r['type']](rmx[1],int(rmx[0]))
+                                    reply.add_answer(
+                                            RR(r['name'], rtype=r['type'],ttl=r['TTL'],
+                                               rdata=rd)
+                                    )
+                                else:
+                                    rd = DNSMAP[r['type']](r['data'])
+                                    reply.add_answer(
+                                        RR(r['name'], rtype=r['type'], ttl=r['TTL'],
+                                           rdata=rd)
+                                    )
+
+                    if dohr is None:
+                        reply = request.reply()
+                        reply.header.rcode = getattr(RCODE, 'NXDOMAIN')
+
+                    return reply
+
+                elif config["DNS_RESOLVER_TYPE"] == 'udp':
+                    orig_proxy_r = request.send(
+                                        self.address,self.port,
+                                        timeout=self.timeout
+                                    )
+                    reply = DNSRecord.parse(orig_proxy_r)
+
+                    if  (request.q.qtype == DNS_AAAA_RECORD) and \
+                        (
+                          (len(reply.rr) < 1) or
+                          (reply.rr[0].rtype != DNS_AAAA_RECORD)
+                        ):
+
+                        request.q.qtype = DNS_A_RECORD
+                        orig_proxy_r = request.send(
+                                    self.address,
+                                    self.port,
+                                    timeout=self.timeout)
+                        orig_reply = DNSRecord.parse(orig_proxy_r)
+                        request.q.qtype = DNS_AAAA_RECORD
+
+                        if len(orig_reply.rr) > 0:
+                            # Upstream results are more than one item,
+                            reply = DNSRecord(
+                                DNSHeader(
+                                    id=orig_reply.header.id,qr=1,ra=1
+                                ),
+                                q=request.q
+                            )
+
+                            for r in orig_reply.rr:
+                                if  (r.rtype != DNS_AAAA_RECORD) and \
+                                    (r.rtype != DNS_A_RECORD):
+                                    # CNAME or some DNS type must be same as upstream result.
+                                    reply.add_answer(
+                                        RR(r.rname, rtype=r.rtype, ttl=r.ttl,
+                                           rdata=r.rdata)
+                                    )
+                                else:
+                                    reply.add_answer(
+                                        RR(r.rname, rtype=DNS_AAAA_RECORD, ttl=r.ttl,
+                                           rdata=self._conv_ipv4_to_v6(r.rdata))
+                                    )
+                else:
+                    proxy_r = request.send(self.address,self.port,
+                                    tcp=True,timeout=self.timeout)
         except socket.timeout:
             reply = request.reply()
             reply.header.rcode = getattr(RCODE,'NXDOMAIN')
