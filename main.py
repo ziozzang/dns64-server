@@ -29,7 +29,7 @@ config = {
     "port": 5354,
     "addr": "0.0.0.0",
 
-    "allow_ip_list": ["0.0.0.0/0",'2001:db8::'],
+    "allow_ip_list": ["0.0.0.0/0",'0::'], # Allow from all
 }
 
 class DNS64ProxyResolver(BaseResolver):
@@ -81,6 +81,7 @@ class DNS64ProxyResolver(BaseResolver):
                                     self.address,self.port,
                                     timeout=self.timeout
                                 )
+                # Originally reply same as upstream result
                 reply = DNSRecord.parse(orig_proxy_r)
 
                 if  (request.q.qtype == DNS_AAAA_RECORD) and \
@@ -88,6 +89,9 @@ class DNS64ProxyResolver(BaseResolver):
                       (len(reply.rr) < 1) or
                       (reply.rr[0].rtype != DNS_AAAA_RECORD)
                     ):
+                    # if need modification,
+                    # - There's no AAAA recored is returned.
+                    # - Other record is mixed reply (for example CNAME -> A or some mixed...)
 
                     request.q.qtype = DNS_A_RECORD
                     orig_proxy_r = request.send(
